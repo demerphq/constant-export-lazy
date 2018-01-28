@@ -1,8 +1,12 @@
 package Constant::Export::Lazy;
+BEGIN {
+    $Constant::Export::Lazy::VERSION = '0.20';
+}
 use 5.006;
 use strict;
 use warnings;
 use warnings FATAL => "recursion";
+use Scalar::Util qw(blessed);
 
 our $_CALL_SHOULD_ALIAS_FROM_TO  = {};
 
@@ -56,6 +60,9 @@ sub import {
     # lazy later by flattening this whole thing now.
     my $normalized_args = _normalize_arguments(%args);
     my $constants = $normalized_args->{constants};
+    my $default_options = $normalized_args->{default_options};
+    my $has_default_options = $normalized_args->{has_default_options};
+    my $fallback_handler = $normalized_args->{fallback_handler};
 
     # This is a callback that can be used to munge the import list, to
     # e.g. provide a facility to provide import tags.
@@ -78,7 +85,10 @@ sub import {
 
         my $ctx = bless {
             constants    => $constants,
+            default_options => $default_options,
+            has_default_options => $has_default_options,
             pkg_importer => $pkg_importer,
+            fallback_handler => $fallback_handler,
 
             # Note that when unpacking @_ above we threw away the
             # package we're imported as from the user's perspective
@@ -122,6 +132,7 @@ sub import {
         # we've been requested to export.
         my @leftover_gimme;
         for my $gimme (@gimme) {
+            $ctx->call_fallback_handler($gimme) if !exists $constants->{$gimme} and $fallback_handler;
             if (exists $constants->{$gimme}) {
                 # We only want to alias constants into the importer's
                 # package if the constant is on the import list, not
@@ -163,6 +174,42 @@ sub import {
     return;
 }
 
+sub _normalize_conf {
+    my ($constant_name, $value, $has_default_options, $default_options)= @_;
+
+    my $return;
+    if (ref $value eq 'CODE') {
+        $return = {
+            call    => $value,
+            ($has_default_options
+             ? (options => \%$default_options)
+             : ()),
+        };
+    } elsif (ref $value eq 'HASH') {
+        my %options = %{ $value->{options} || {} };
+        $return = {
+            (exists $value->{call}
+             ? (call => $value->{call})
+             : ()),
+            (($has_default_options or keys %options)
+             ? (
+                 options => {
+                     %$default_options,
+                     %options,
+                 }
+             )
+             : ()),
+        };
+    } elsif (blessed($value) && $value->can("get_constant_export_lazy_conf")) {
+        $return= { blessed => $value };
+    } else {
+        die sprintf "PANIC: The constant <$constant_name> has some value type we don't know about (ref = %s)",
+            ref $value || 'Undef';
+    }
+    $return->{name}= $constant_name;
+    return $return;
+}
+
 sub _normalize_arguments {
     my (%args) = @_;
 
@@ -172,40 +219,27 @@ sub _normalize_arguments {
     my %new_constants;
     for my $constant_name (keys %constants) {
         my $value = $constants{$constant_name};
-        if (ref $value eq 'CODE') {
-            $new_constants{$constant_name} = {
-                call    => $value,
-                ($has_default_options
-                 ? (options => \%default_options)
-                 : ()),
-            };
-        } elsif (ref $value eq 'HASH') {
-            my %options = %{ $value->{options} || {} };
-            $new_constants{$constant_name} = {
-                (exists $value->{call}
-                 ? (call => $value->{call})
-                 : ()),
-                (($has_default_options or keys %options)
-                 ? (
-                     options => {
-                         %default_options,
-                         %options,
-                     }
-                 )
-                 : ()),
-            };
-        } else {
-            die sprintf "PANIC: The constant <$constant_name> has some value type we don't know about (ref = %s)",
-                ref $value || 'Undef';
-        }
+        $new_constants{$constant_name}= _normalize_conf($constant_name, $value,$has_default_options,\%default_options);
     }
 
     $args{constants} = \%new_constants;
+    $args{default_options}= \%default_options;
+    $args{has_default_options}= $has_default_options;
 
     return \%args;
 }
 
 our $_GETTING_VALUE_FOR_OVERRIDE = {};
+
+sub Constant::Export::Lazy::Ctx::call_fallback_handler {
+    my ($ctx, $gimme)= @_;
+    my $handler= $ctx->{fallback_handler}
+        or return;
+    my $conf= $handler->($ctx, $gimme);
+    if ($conf) {
+        $ctx->{constants}{$gimme}= _normalize_conf($gimme,$conf,@{$ctx}{'has_default_options','default_options'});
+    }
+}
 
 sub Constant::Export::Lazy::Ctx::call {
     my ($ctx, $gimme) = @_;
@@ -216,10 +250,19 @@ sub Constant::Export::Lazy::Ctx::call {
     my $constants            = $ctx->{constants};
     my $wrap_existing_import = $ctx->{wrap_existing_import};
 
+    $ctx->call_fallback_handler($gimme)
+        if !exists $constants->{$gimme} and $ctx->{fallback_handler};
+
     # Unless we're wrapping an existing import ->call($gimme) should
     # always be called with a $gimme that we know about.
     unless (exists $constants->{$gimme}) {
         die "PANIC: You're trying to get the value of an unknown constant ($gimme), and wrap_existing_import isn't set" unless $wrap_existing_import;
+    }
+
+    if (my $blessed= $constants->{$gimme}->{blessed}) {
+        my ($name,$conf)= $blessed->get_constant_export_lazy_conf($ctx);
+        if ($name ne $gimme) { die "get_conf() expected to return a list of NAME => CONFIG_HASH"; }
+        $constants->{$gimme}= _normalize_conf($name,$conf,@{$ctx}{'has_default_options','default_options'});
     }
 
     my ($private_name, $glob_name, $alias_as);
